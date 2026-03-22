@@ -88,7 +88,7 @@ SUCCESS: Report complete
 **With `--k8s`** (example — only clusters whose CP or node pool references this subnet appear):
 
 ```text
-Kubernetes (NKP) on subnet vlan402:
+NKP Cluster(s) on subnet vlan402:
 my-workload-cluster
   |_Control Plane VIP: 10.38.42.50
   |_Node Pool VIP(s): 10.38.42.100-10.38.42.120
