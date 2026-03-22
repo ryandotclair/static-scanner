@@ -50,10 +50,15 @@ Prism Central credentials are required and can be set in the following ways (in 
     --password <password>
 
 
+  --k8s                      After the Nutanix VM report, query the current kubectl context
+                             (NKP management cluster) for Cluster objects: for each Nutanix
+                             workload cluster whose control plane or a node pool uses this
+                             subnet name, print API VIP and service LB address range(s).
+
   -v, --verbose              Main stages on stderr; also full API request/response bodies
   -h, --help                 This help
 
-Also requires: jq, perl (for static-range math), curl.
+Also requires: jq, perl (for static-range math), curl. With --k8s: kubectl (pointed at mgmt cluster).
 
 EOF
     exit 1
@@ -63,6 +68,7 @@ FILTER_SUBNET_NAME=""
 OPT_PC=""
 OPT_USER=""
 OPT_PASS=""
+INCLUDE_K8S=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -86,6 +92,7 @@ while [ $# -gt 0 ]; do
             OPT_PASS="$2"
             shift 2
             ;;
+        --k8s) INCLUDE_K8S=true; shift ;;
         -v|--verbose) VERBOSE=true; shift ;;
         -h|--help) usage ;;
         *) error "Unknown option: $1"; usage ;;
@@ -162,6 +169,91 @@ make_api_request() {
         echo "========== end ==========" >&2
     fi
     printf '%s\n' "$raw"
+}
+
+# Optional: NKP workload clusters whose CP or node pool uses this subnet (kubectl → mgmt cluster).
+EmitK8sClustersOnSubnet() {
+    local subnetName="${1:?}"
+    if [ "$INCLUDE_K8S" != true ]; then
+        return 0
+    fi
+    echo ""
+    echo "NKP Cluster(s) on subnet ${subnetName}:"
+    if ! command -v kubectl &>/dev/null; then
+        warning "kubectl not found; cannot list workload clusters."
+        echo "  (skipped)"
+        return 0
+    fi
+    if ! kubectl config current-context &>/dev/null; then
+        warning "No current kubectl context; point kubeconfig at the NKP management cluster."
+        echo "  (skipped)"
+        return 0
+    fi
+    stage "kubectl get cluster -A (Nutanix provider workloads)"
+    local raw
+    if ! raw=$(kubectl get cluster -A -o json 2>/dev/null); then
+        warning "kubectl get cluster -A -o json failed (needs cluster-api Clusters on the mgmt cluster)."
+        echo "  (skipped)"
+        return 0
+    fi
+    local printedAny=false
+    while IFS= read -r item; do
+        [ -z "$item" ] && continue
+        local cname cpNames npNames
+        cname=$(echo "$item" | jq -r '.metadata.name // empty')
+        [ -z "$cname" ] && continue
+        cpNames=$(echo "$item" | jq -r '
+            [.spec.topology.variables[]?.value.controlPlane.nutanix.machineDetails.subnets[]?.name // empty]
+            | unique
+            | .[]
+        ')
+        npNames=$(echo "$item" | jq -r '
+            [.spec.topology.workers.machineDeployments[]?.variables.overrides[]?.value.nutanix.machineDetails.subnets[]?.name // empty]
+            | unique
+            | .[]
+        ')
+        local cpMatch=false npMatch=false
+        echo "$cpNames" | grep -Fxq "$subnetName" && cpMatch=true || true
+        echo "$npNames" | grep -Fxq "$subnetName" && npMatch=true || true
+        if [ "$cpMatch" != true ] && [ "$npMatch" != true ]; then
+            continue
+        fi
+        printedAny=true
+        echo "${cname}"
+        if [ "$cpMatch" = true ]; then
+            local vip
+            vip=$(echo "$item" | jq -r '.spec.controlPlaneEndpoint.host // empty')
+            if [ -z "$vip" ]; then
+                vip="(unknown)"
+            fi
+            echo "  |_Control Plane VIP: ${vip}"
+        fi
+        if [ "$npMatch" = true ]; then
+            local lbJoined
+            lbJoined=$(echo "$item" | jq -r '
+                def ipstr(v):
+                    if v == null then ""
+                    elif (v|type) == "string" then v
+                    elif (v|type) == "object" and (v.value|type) == "string" then v.value
+                    elif (v|type) == "object" and (v.value|type) == "number" then (v.value|tostring)
+                    else "" end;
+                [
+                  .spec.topology.variables[]?.value.addons.serviceLoadBalancer.configuration.addressRanges[]?
+                  | (ipstr(.start) + "-" + ipstr(.end))
+                ]
+                | map(select(length > 2 and . != "--"))
+                | unique
+                | join(", ")
+            ')
+            if [ -z "$lbJoined" ]; then
+                lbJoined="(no service LB address range in cluster spec)"
+            fi
+            echo "  |_Node Pool VIP(s): ${lbJoined}"
+        fi
+    done < <(echo "$raw" | jq -c '.items[]? | select(((.metadata.labels["konvoy.d2iq.io/provider"] // "") | ascii_downcase) == "nutanix")')
+    if [ "$printedAny" = false ]; then
+        echo "  (no Nutanix workload clusters use this subnet for control plane or node pools in the current kubectl context)"
+    fi
 }
 
 TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'ip-used-check')
@@ -329,56 +421,46 @@ VM_COUNT=$(wc -l < "$VM_IDS_FILE" | tr -d '[:space:]')
 [ -z "$VM_COUNT" ] && VM_COUNT=0
 stage "Unique VMs attached to subnet: ${VM_COUNT}"
 
-if [ "$VM_COUNT" -eq 0 ]; then
-    echo "subnet: ${FILTER_SUBNET_NAME}"
-    echo "subnet range: ${SUBNET_CIDR}"
-    echo "DHCP pool: ${DHCP_POOL_TXT}"
-    echo "static range: ${STATIC_RANGE_TXT}"
-    echo "Used Static IPs:"
-    echo "  (no VMs returned for this subnet)"
-    success "Report complete"
-    exit 0
+if [ "$VM_COUNT" -gt 0 ]; then
+    stage "Per-VM: GET v4.2 AHV VM config; learnedIpAddresses on NICs for this subnet"
+    # --- Per VM: v4.2 VMM AHV config; learnedIpAddresses on NICs for this subnet extId ---
+    while IFS= read -r VM_UUID; do
+        [ -z "$VM_UUID" ] && continue
+        VM_EP="${BASE_URL}/api/vmm/v4.2/ahv/config/vms/${VM_UUID}"
+        VR=$(make_api_request "GET" "$VM_EP")
+        VC=$(printf '%s\n' "$VR" | tail -n1)
+        VB=$(printf '%s\n' "$VR" | sed '$d')
+        if [ "$VC" != "200" ]; then
+            warning "VM GET failed for ${VM_UUID} (HTTP ${VC}), skipping."
+            continue
+        fi
+
+        VM_NAME=$(printf '%s\n' "$VB" | jq -r '.data.name // "Unknown"' 2>/dev/null)
+
+        # Subnet match on nicNetworkInfo and networkInfo (both may be present); static = learnedIpAddresses[].value
+        IPS=$(printf '%s\n' "$VB" | jq -r --arg su "$FILTER_SUBNET_UUID" '
+            [
+              .data.nics[]?
+              | select(
+                  ((.nicNetworkInfo.subnet.extId // "") == $su)
+                  or ((.networkInfo.subnet.extId // "") == $su)
+                )
+              | (
+                  (.nicNetworkInfo.ipv4Info.learnedIpAddresses // [])
+                  + (.networkInfo.ipv4Info.learnedIpAddresses // [])
+                )[]
+              | .value?
+              | select(. != null and . != "")
+            ]
+            | unique
+            | join(",")
+        ' 2>/dev/null)
+
+        if [ -n "$IPS" ] && [ "$IPS" != "null" ]; then
+            echo "${VM_NAME}|${IPS}" >> "$STATIC_ROWS_FILE"
+        fi
+    done < "$VM_IDS_FILE"
 fi
-
-stage "Per-VM: GET v4.2 AHV VM config; learnedIpAddresses on NICs for this subnet"
-
-# --- Per VM: v4.2 VMM AHV config; learnedIpAddresses on NICs for this subnet extId ---
-while IFS= read -r VM_UUID; do
-    [ -z "$VM_UUID" ] && continue
-    VM_EP="${BASE_URL}/api/vmm/v4.2/ahv/config/vms/${VM_UUID}"
-    VR=$(make_api_request "GET" "$VM_EP")
-    VC=$(printf '%s\n' "$VR" | tail -n1)
-    VB=$(printf '%s\n' "$VR" | sed '$d')
-    if [ "$VC" != "200" ]; then
-        warning "VM GET v4 ${VM_UUID} failed HTTP ${VC}, skipping."
-        continue
-    fi
-
-    VM_NAME=$(printf '%s\n' "$VB" | jq -r '.data.name // "Unknown"' 2>/dev/null)
-
-    # Subnet match on nicNetworkInfo and networkInfo (both may be present); static = learnedIpAddresses[].value
-    IPS=$(printf '%s\n' "$VB" | jq -r --arg su "$FILTER_SUBNET_UUID" '
-        [
-          .data.nics[]?
-          | select(
-              ((.nicNetworkInfo.subnet.extId // "") == $su)
-              or ((.networkInfo.subnet.extId // "") == $su)
-            )
-          | (
-              (.nicNetworkInfo.ipv4Info.learnedIpAddresses // [])
-              + (.networkInfo.ipv4Info.learnedIpAddresses // [])
-            )[]
-          | .value?
-          | select(. != null and . != "")
-        ]
-        | unique
-        | join(",")
-    ' 2>/dev/null)
-
-    if [ -n "$IPS" ] && [ "$IPS" != "null" ]; then
-        echo "${VM_NAME}|${IPS}" >> "$STATIC_ROWS_FILE"
-    fi
-done < "$VM_IDS_FILE"
 
 # --- Report (stdout) ---
 stage "Write report to stdout"
@@ -387,13 +469,17 @@ echo "subnet range: ${SUBNET_CIDR}"
 echo "DHCP pool: ${DHCP_POOL_TXT}"
 echo "static range: ${STATIC_RANGE_TXT}"
 echo "Used Static IPs:"
-if [ ! -s "$STATIC_ROWS_FILE" ]; then
+if [ "$VM_COUNT" -eq 0 ]; then
+    echo "  (no VMs returned for this subnet)"
+elif [ ! -s "$STATIC_ROWS_FILE" ]; then
     echo "  (no static IPs discovered on this subnet)"
 else
     sort -t'|' -k1,1 "$STATIC_ROWS_FILE" | while IFS='|' read -r rname rips; do
         echo "  |_${rname}: ${rips}"
     done
 fi
+
+EmitK8sClustersOnSubnet "$FILTER_SUBNET_NAME"
 
 echo ""
 success "Report complete"

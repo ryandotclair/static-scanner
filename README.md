@@ -12,7 +12,7 @@ Helpful when needing to understand available IP ranges available for NKP.
 |-----------|-----------------|
 | **Prism Central** | **2024.3** or later (script uses **v4.2** Networking and VMM AHV endpoints). |
 | **Prism Element (AHV)** | **6.8** or later on clusters registered to that PC (VM/NIC payload shape must match current v4.2 AHV VM APIs). |
-| **Client host** | `bash`, `curl`, `jq`, `perl` (for CIDR/DHCP static-range math), `base64` (for Basic auth). |
+| **Client host** | `bash`, `curl`, `jq`, `perl` (for CIDR/DHCP static-range math), `base64` (for Basic auth), `kubectl` (optional, with current context pointed at NKP Management Cluster). |
 | **Network** | Outbound HTTPS from the machine running the script to Prism Central (typically port **9440**). |
 
 Prism Central Account Permission (Only ONE of these is required):
@@ -33,6 +33,7 @@ Prism Central Account Permission (Only ONE of these is required):
 | Option | Description |
 |--------|-------------|
 | `-s`, `--subnet-name` | **Required.** Subnet name as shown in PC (e.g. `vlan402`). |
+| `--k8s` | After the VM report, use **kubectl** (current context = NKP **management** cluster) to list **Cluster** CRs. For each **Nutanix** workload cluster whose **control plane** or **node pool** uses that subnet **name**, print the **API VIP** and **service load balancer** address range(s). Requires `kubectl` and cluster-api `Cluster` objects on the mgmt cluster. |
 | `-v`, `--verbose` | Print main **stages** on stderr and full **API request/response** bodies (debug mode). |
 | `-h`, `--help` | Show help and exit. |
 
@@ -59,6 +60,13 @@ Or with a local `env.vars` next to the script:
 ./static-scanner.sh -s vlan402
 ```
 
+With Kubernetes / NKP metadata (subnet name must match the Nutanix subnet names in the Cluster spec):
+
+```bash
+kubectl config use-context <your-nkp-mgmt-context>
+./static-scanner.sh -s vlan402 --k8s
+```
+
 ---
 
 ## Example output
@@ -75,6 +83,15 @@ Used Static IPs:
   |_db-01: 10.38.42.127,10.38.42.128
 
 SUCCESS: Report complete
+```
+
+**With `--k8s`** (example — only clusters whose CP or node pool references this subnet appear):
+
+```text
+Kubernetes (NKP) on subnet vlan402:
+my-workload-cluster
+  |_Control Plane VIP: 10.38.42.50
+  |_Node Pool VIP(s): 10.38.42.100-10.38.42.120
 ```
 
 **No VMs with vNICs on that subnet:**
