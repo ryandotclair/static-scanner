@@ -1,51 +1,71 @@
 # Purpose
 
-Report **static IPv4 addresses** used by VMs on a **single Nutanix managed subnet**, using Prism Central **Networking v4.2** and **VMM v4.2 AHV** APIs.
+Two related workflows against **Prism Central**:
 
-Helpful when needing to understand available IP ranges available for NKP.
+1. **Subnet report (default)** — For one **subnet name**, print CIDR, DHCP pool, a derived “static carve-out” line (when `perl` is available), and **VMs whose NICs report guest-learned IPv4** on that subnet (aligned with **learned** addressing, not load-balancer **assigned** VIPs).
+2. `**--check` (optional)** — Given one **IPv4**, scan **VM inventory** and report whether any NIC’s contains that address. Returns any matching with **VM name** and **matched subnet**. Use alone for a **global** check, or with `**-s`** to only consider NICs on that subnet.
+
+Useful for NKP prep: see what addresses are already observed on a VLAN, and probe a single address before assigning it.
 
 ---
 
 ## Requirements
 
-| Component | Version / notes |
-|-----------|-----------------|
-| **Prism Central** | **2024.3** or later (script uses **v4.2** Networking and VMM AHV endpoints). |
-| **Prism Element (AHV)** | **6.8** or later on clusters registered to that PC (VM/NIC payload shape must match current v4.2 AHV VM APIs). |
-| **Client host** | `bash`, `curl`, `jq`, `perl` (for CIDR/DHCP static-range math), `base64` (for Basic auth), `kubectl` (optional, with current context pointed at NKP Management Cluster). |
-| **Network** | Outbound HTTPS from the machine running the script to Prism Central (typically port **9440**). |
 
-Prism Central Account Permission (Only ONE of these is required):
-- VPC Admin
-- Prism Admin
-- Super Admin
-- Network Infra Admin
-- Backup Admin
+| Component         | Notes                                                                                                                                                                                                                                                           |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Prism Central** | Tested on **v7.3+** PC                                                                                                                                                                                                                                          |
+| **Client**        | `bash`, `curl`, `jq`, `base64` (Basic auth). `**perl`** — used for the **subnet report** “static range” line (CIDR minus first DHCP pool); optional (script substitutes a hint if `perl` is missing). `**kubectl`** — only with `**--k8s**` in **report** mode. |
+| **Network**       | HTTPS to Prism Central (typically **9440**).                                                                                                                                                                                                                    |
+
+
+**PC role permissions** (one of these is typically enough): VPC Admin, Prism Admin, Super Admin, Network Infra Admin, or Backup Admin — match your org’s least-privilege policy.
 
 ---
 
 ## Usage
 
+**Subnet report:**
+
 ```bash
 ./static-scanner.sh -s|--subnet-name <name> [options]
 ```
 
-| Option | Description |
-|--------|-------------|
-| `-s`, `--subnet-name` | **Required.** Subnet name as shown in PC (e.g. `vlan402`). |
-| `--k8s` | After the VM report, use **kubectl** (current context = NKP **management** cluster) to list **Cluster** CRs. For each **Nutanix** workload cluster whose **control plane** or **node pool** uses that subnet **name**, print the **API VIP** and **service load balancer** address range(s). Requires `kubectl` and cluster-api `Cluster` objects on the mgmt cluster. |
-| `-v`, `--verbose` | Print main **stages** on stderr and full **API request/response** bodies (debug mode). |
-| `-h`, `--help` | Show help and exit. |
+**IP check (optional second mode):**
 
-**Prism Central credentials**. 3 Options listed in order of prescendence:
+```bash
+./static-scanner.sh --check <A.B.C.D> [options]
+./static-scanner.sh --check <A.B.C.D> -s <name>   # limit NICs to that subnet only
+```
 
-1. **Export** before running:  
-   `NUTANIX_ENDPOINT`, `NUTANIX_USER`, `NUTANIX_PASSWORD`
-2. **`env.vars`** in the **same directory as the script** (sourced automatically if present), with the three req environment variables.
-3. **CLI**: `--pc <url>`, `--user <name>`, `--password '<secret>'`  
-   - `--pc` may be `https://fqdn_or_IP:9440` or `fqdn_or_IP:9440`.  
 
-**Example:**
+| Option                | Description                                                                                                                                                                                                                                                                                                                                                |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-s`, `--subnet-name` | **Required** for **report** mode. Subnet name as in PC (e.g. `vlan402`). **Optional** with `**--check`**: if set, only NICs on that subnet are considered (faster, answers “free on this segment?”).                                                                                                                                                       |
+| `--check` `<IPv4>`    | **Optional.** Scan **all** VMs (paginated v3 `vms/list`) for NICs whose `**ip_endpoint_list[].ip`** equals the address (**any** `type`). Prints **VM name**, **matched subnet** (name + uuid when available), and **endpoint type**. `**--k8s` is not allowed** with `--check`.                                                                            |
+| `--k8s`               | **Report mode only.** After the VM section, use **kubectl** (current context = NKP **management** cluster) to list **Cluster** CRs; for each **Nutanix** workload cluster whose **control plane** or **node pool** references that subnet **name**, print **API VIP** and **service LB** range(s). Requires `kubectl` and cluster-api **Cluster** objects. |
+| `-v`, `--verbose`     | **Stages** and `**INFO`** on stderr; full **curl** request/response dumps. Expected v3/v4.2 fallback messages use `**verbose_warning`** (stderr **only with `-v`**). With `**--check**`, also prints **VM uuid** on stderr per hit.                                                                                                                        |
+| `-h`, `--help`        | Built-in help.                                                                                                                                                                                                                                                                                                                                             |
+
+
+**Credentials** (**highest takes priority first)**:
+
+1. **CLI:** `--pc`, `--user`, `--password` — explicit flags win over everything else.
+2. **Environment variables** set **before** you run the script: `NUTANIX_ENDPOINT`, `NUTANIX_USER`, `NUTANIX_PASSWORD`. These **override** values from `env.vars` if both exist.
+3. `**env.vars`** next to the script (sourced if present) — lowest precedence.
+
+---
+
+## Examples
+
+One-liner with flags (no env file):
+
+```bash
+./static-scanner.sh -s vlan402 \
+  --pc 'https://pc.example.com:9440' --user admin --password 'secret'
+```
+
+Using exports (overrides `env.vars` if you have both):
 
 ```bash
 export NUTANIX_ENDPOINT='https://pc.example.com:9440'
@@ -54,24 +74,28 @@ export NUTANIX_PASSWORD='secret'
 ./static-scanner.sh -s vlan402
 ```
 
-Or with a local `env.vars` next to the script:
-
 ```bash
-./static-scanner.sh -s vlan402
+kubectl config use-context <nkp-mgmt-context>
+./static-scanner.sh -s vlan402 --k8s
 ```
 
-With Kubernetes / NKP metadata (subnet name must match the Nutanix subnet names in the Cluster spec):
+Global address check (any subnet on this PC):
 
 ```bash
-kubectl config use-context <your-nkp-mgmt-context>
-./static-scanner.sh -s vlan402 --k8s
+./static-scanner.sh --check 10.38.48.140 --pc "https://pc.example.com:9440" --user admin --password 'secret'
+```
+
+Same address, only NICs on subnet `secondary` (PC from `env.vars` or env):
+
+```bash
+./static-scanner.sh -s secondary --check 10.38.48.140
 ```
 
 ---
 
 ## Example output
 
-**Normal case (VMs present, some with learned IPs on the subnet):**
+**Subnet report — VMs with learned IPs:**
 
 ```text
 subnet: vlan402
@@ -85,7 +109,7 @@ Used Static IPs:
 SUCCESS: Report complete
 ```
 
-**With `--k8s`** (example — only clusters whose CP or node pool references this subnet appear):
+**With `--k8s`:**
 
 ```text
 NKP Cluster(s) on subnet vlan402:
@@ -94,36 +118,51 @@ my-workload-cluster
   |_Node Pool VIP(s): 10.38.42.100-10.38.42.120
 ```
 
-**No VMs with vNICs on that subnet:**
+**No VMs on that subnet (or vNIC list empty):**
 
 ```text
-subnet: vlan402
-subnet range: 10.38.42.0/25
-DHCP pool: 10.38.42.2-10.38.42.125
-static range: 10.38.42.126
 Used Static IPs:
   (no VMs returned for this subnet)
-
-SUCCESS: Report complete
 ```
 
-**VMs exist but no static discovered IPs on that subnet in the API response:**
+**VMs present but no learned IPs in API response for that subnet:**
 
 ```text
-subnet: vlan402
-subnet range: 10.38.42.0/25
-DHCP pool: 10.38.42.2-10.38.42.125
-static range: 10.38.42.126
 Used Static IPs:
-  (no static IPs discovered on this subnet))
-
-SUCCESS: Report complete
+  (no static IPs discovered on this subnet)
 ```
 
-*(Exact CIDR, DHCP pool, static range line, and VM names/IPs depend on your environment.)*
+`**--check` — in use:**
+
+```text
+check: 10.38.48.140
+Scope: all subnets on this Prism Central — any VM NIC. Note: the same dotted quad can legitimately appear on different L2 segments; this lists every NIC that reports it.
+Result: In Use!
+  |_ VM: nkp-wlc-a-bnlnd-52smv — subnet: secondary (uuid=f8301000-a5cf-413d-a7ec-cdc9d43db7cb) — endpoint type: LEARNED
+
+SUCCESS: Check complete
+```
+
+`**--check` — not found:**
+
+```text
+check: 10.38.48.99
+…
+Result: Not found in use.
+
+SUCCESS: Check complete
+```
+
+*(Exact strings depend on your PC and data.)*
+
+---
+
+## Notes
+
+- **Uniqueness:** The same IPv4 string can appear on **different** subnets; `**--check*`* without `**-s**` reports **every** NIC that carries that IP. With `**-s`**, only NICs on the resolved subnet uuid are scanned.
 
 ---
 
 ## License / support
 
-Typical CYA disclosure: Use at your own risk. Not officially supported script. Always validate against your PC/PE versions in non-production first.
+Use at your own risk. Not an officially supported script. Validate against your PC/PE versions in non-production first.

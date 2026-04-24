@@ -35,42 +35,52 @@ stage() {
 
 usage() {
     cat << EOF
-Usage: $0 -s <subnet_name>
+Usage: $0 -s <subnet_name>   (subnet report — default mode)
+   or: $0 --check <A.B.C.D>  (global IP-in-use check; optional -s to limit NICs to one subnet)
 
-Produce a static-IP usage report for one targeted subnet.
+Produce a static-IP usage report for one targeted subnet, or check a single IPv4 against VM NICs.
 
-  -s, --subnet-name <name>   Subnet name (e.g. vlan402) — required
+  -s, --subnet-name <name>   Subnet name (e.g. vlan402). Required for report mode. With --check,
+                             optional: limits the scan to NICs on that subnet only (faster).
+
+  --check <IPv4>             List any VM whose NIC reports this IP (v3 ip_endpoint_list, any type).
+                             Without -s: scans all VMs on Prism Central (any subnet). With -s:
+                             only NICs attached to that subnet. Note: the same address can exist on
+                             different private subnets; global mode reports every NIC that carries it.
 
 Prism Central credentials are required and can be set in the following ways (in order of precedence):
 
-  A) Export before running (highest precedence — not overwritten by env.vars):
+  A) Command line flags (highest — override env and env.vars):
+    --pc <url>
+    --user <name>
+    --password <password>
+
+  B) Export before running (wins over env.vars; overridden by flags above):
        export NUTANIX_ENDPOINT=https://<pc-ip>:9440
        export NUTANIX_USER=<user>
        export NUTANIX_PASSWORD='<password>'
 
-  B) File called "env.vars" next to this script with above variables configured (sourced automatically if present).
-
-  C) Command line flags: 
-    --pc <url>
-    --user <name>
-    --password <password>
+  C) File called "env.vars" next to this script with above variables configured (sourced automatically if present).
 
 
   --k8s                      After the Nutanix VM report, query the current kubectl context
                              (NKP management cluster) for Cluster objects: for each Nutanix
                              workload cluster whose control plane or a node pool uses this
                              subnet name, print API VIP and service LB address range(s).
+                             Not allowed with --check.
 
   -v, --verbose              Main stages on stderr; also full API request/response bodies
   -h, --help                 This help
 
 Also requires: jq, perl (for static-range math), curl. With --k8s: kubectl (pointed at mgmt cluster).
+Check mode (--check) uses jq and curl only (no perl).
 
 EOF
     exit 1
 }
 
 FILTER_SUBNET_NAME=""
+CHECK_IP=""
 OPT_PC=""
 OPT_USER=""
 OPT_PASS=""
@@ -78,6 +88,11 @@ INCLUDE_K8S=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --check)
+            [ -z "${2:-}" ] && { error "--check requires an IPv4 address"; usage; }
+            CHECK_IP="$2"
+            shift 2
+            ;;
         -s|--subnet-name)
             [ -z "${2:-}" ] && { error "-s requires a value"; usage; }
             FILTER_SUBNET_NAME="$2"
@@ -105,8 +120,24 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ -z "$FILTER_SUBNET_NAME" ]; then
-    error "Subnet name is required (use -s or --subnet-name)."
+if [ -z "$CHECK_IP" ] && [ -z "$FILTER_SUBNET_NAME" ]; then
+    error "Either -s/--subnet-name (subnet report) or --check <IPv4> is required."
+    usage
+fi
+if [ -n "$CHECK_IP" ]; then
+    if ! [[ "$CHECK_IP" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        error "Invalid IPv4 for --check: ${CHECK_IP}"
+        usage
+    fi
+    for _oct in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+        if [ "$_oct" -gt 255 ] 2>/dev/null; then
+            error "Invalid IPv4 octet in --check: ${CHECK_IP}"
+            usage
+        fi
+    done
+fi
+if [ -n "$CHECK_IP" ] && [ "$INCLUDE_K8S" = true ]; then
+    error "--k8s cannot be used with --check."
     usage
 fi
 
@@ -154,7 +185,8 @@ VNICS_PAGE_LIMIT=100
 if [ "$VERBOSE" = true ]; then
     echo "================================================"
     echo "Using..."
-    echo "SUBNET_NAME: ${FILTER_SUBNET_NAME}"
+    echo "SUBNET_NAME: ${FILTER_SUBNET_NAME:-"(none — check scans all subnets)"}"
+    echo "CHECK_IP: ${CHECK_IP:-"(report mode)"}"
     echo "NUTANIX_USER: ${NUTANIX_USER}"
     echo "NUTANIX_PASSWORD: ${NUTANIX_PASSWORD}"
     echo "NUTANIX_ENDPOINT: ${BASE_URL}"
@@ -183,6 +215,87 @@ make_api_request() {
         echo "========== end ==========" >&2
     fi
     printf '%s\n' "$raw"
+}
+
+# Paginate v3 vms/list; any ip_endpoint_list[].ip matching CHECK_IP (all endpoint types: ASSIGNED, LEARNED, …).
+# If FILTER_SUBNET_UUID is set, only NICs whose subnet_reference.uuid matches.
+RunCheckIpAcrossVms() {
+    local ep="${BASE_URL}/api/nutanix/v3/vms/list"
+    local lim=500 off=0 got tot body resp code hitsPath scopeLine
+    hitsPath="${TMP_DIR}/ip_check_hits.tsv"
+    : > "$hitsPath"
+
+    if [ -n "${FILTER_SUBNET_UUID:-}" ]; then
+        scopeLine="Scope: subnet \"${FILTER_SUBNET_NAME}\" only (uuid ${FILTER_SUBNET_UUID}) — NICs on other subnets are ignored."
+    else
+        scopeLine="Scope: all subnets on this Prism Central — any VM NIC. Note: the same IP address can legitimately appear on different L2 segments; this lists every NIC that reports it."
+    fi
+
+    stage "Check ${CHECK_IP} against VM inventory (v3 POST /vms/list)"
+    off=0
+    while true; do
+        body=$(jq -nc --argjson o "$off" --argjson l "$lim" '{kind:"vm",length:$l,offset:$o}')
+        resp=$(make_api_request "POST" "$ep" "$body")
+        code=$(printf '%s\n' "$resp" | tail -n1)
+        body=$(printf '%s\n' "$resp" | sed '$d')
+        if [ "$code" != "200" ]; then
+            error "v3 vms/list failed HTTP ${code} at offset=${off}"
+            exit 1
+        fi
+        printf '%s\n' "$body" | jq -r --arg ip "$CHECK_IP" --arg su "${FILTER_SUBNET_UUID-}" '
+            def subId(n):
+                (n.subnet_reference
+                 | if . == null then ""
+                   elif type == "object" then (.uuid // "")
+                   else (. | tostring) end);
+            def subnetLabel(n):
+                (n.subnet_reference // null) as $sr
+                | if $sr == null then "(no subnet ref)"
+                  elif ($sr | type) == "object" then
+                    (if ($sr.name // "") != "" then "\($sr.name) (uuid=\($sr.uuid // "?"))" else "uuid=\($sr.uuid // "?")" end)
+                  else "?"
+                  end;
+            (.entities // [])[]
+            | .metadata.uuid as $uuid
+            | (.status.name // .spec.name // $uuid) as $vmname
+            | [
+                (.status.resources.nic_list // [])[],
+                (.spec.resources.nic_list // [])[]
+                | select(($su | length) == 0 or (subId(.) == $su))
+                | . as $nic
+                | ($nic.ip_endpoint_list // [])[]
+                | select((.ip // "") == $ip)
+                | "\($vmname)\t\(subnetLabel($nic))\t\((.type // "?") | tostring)\t\($uuid)"
+              ]
+            | .[]
+        ' 2>/dev/null >> "$hitsPath" || true
+
+        got=$(printf '%s\n' "$body" | jq '(.entities // []) | length' 2>/dev/null || echo "0")
+        tot=$(printf '%s\n' "$body" | jq -r '.metadata.total_matches // empty' 2>/dev/null || true)
+        [ "$got" -eq 0 ] && break
+        if [ -n "$tot" ] && [ "$tot" -gt 0 ] 2>/dev/null; then
+            off=$((off + got))
+            [ "$off" -ge "$tot" ] && break
+        elif [ "$got" -lt "$lim" ]; then
+            break
+        else
+            off=$((off + got))
+        fi
+    done
+
+    echo "check: ${CHECK_IP}"
+    echo "${scopeLine}"
+    if [ ! -s "$hitsPath" ]; then
+        echo "Result: Not found in use."
+    else
+        echo "Result: In Use!"
+        sort -u "$hitsPath" | while IFS=$'\t' read -r _vmn _subnet _typ _uuid; do
+            echo "  |_ VM: ${_vmn} — subnet: ${_subnet} — endpoint type: ${_typ}"
+            if [ "$VERBOSE" = true ]; then
+                echo "      (vm uuid: ${_uuid})" >&2
+            fi
+        done
+    fi
 }
 
 # Optional: NKP workload clusters whose CP or node pool uses this subnet (kubectl → mgmt cluster).
@@ -353,48 +466,65 @@ ResolveSubnetViaV3List() {
     return 1
 }
 
-# --- Resolve subnet extId by name (paginated v4.2 list, or v3 list on first-page 404) ---
-stage "Resolve subnet id by name (v4.2 GET /config/subnets, paginated)"
-SUBNET_LIST_PAGE=0
-while true; do
-    EP="${BASE_URL}/api/networking/v4.2/config/subnets?\$page=${SUBNET_LIST_PAGE}&\$limit=${SUBNET_LIST_PAGE_LIMIT}"
-    RESP=$(make_api_request "GET" "$EP")
-    CODE=$(printf '%s\n' "$RESP" | tail -n1)
-    BODY=$(printf '%s\n' "$RESP" | sed '$d')
-    if [ "$CODE" != "200" ]; then
-        if [ "$SUBNET_LIST_PAGE" -eq 0 ] && [ "$CODE" = "404" ]; then
-            SUBNET_SOURCE="v3"
-            ResolveSubnetViaV3List || exit 1
+# Resolve FILTER_SUBNET_NAME → FILTER_SUBNET_UUID and SUBNET_SOURCE (v4.2 list or v3 list on 404).
+ResolveSubnetIdentityFromName() {
+    stage "Resolve subnet id by name (v4.2 GET /config/subnets, paginated)"
+    SUBNET_SOURCE="v42"
+    FILTER_SUBNET_UUID=""
+    SUBNET_LIST_PAGE=0
+    while true; do
+        EP="${BASE_URL}/api/networking/v4.2/config/subnets?\$page=${SUBNET_LIST_PAGE}&\$limit=${SUBNET_LIST_PAGE_LIMIT}"
+        RESP=$(make_api_request "GET" "$EP")
+        CODE=$(printf '%s\n' "$RESP" | tail -n1)
+        BODY=$(printf '%s\n' "$RESP" | sed '$d')
+        if [ "$CODE" != "200" ]; then
+            if [ "$SUBNET_LIST_PAGE" -eq 0 ] && [ "$CODE" = "404" ]; then
+                SUBNET_SOURCE="v3"
+                ResolveSubnetViaV3List || exit 1
+                break
+            fi
+            error "Subnet list failed HTTP ${CODE}"
+            printf '%s\n' "$BODY" >&2
+            exit 1
+        fi
+        FILTER_SUBNET_UUID=$(printf '%s\n' "$BODY" | jq -r --arg n "$FILTER_SUBNET_NAME" '
+            .data[]? | select(.name == $n) | .extId' 2>/dev/null | head -n1)
+        if [ -n "$FILTER_SUBNET_UUID" ] && [ "$FILTER_SUBNET_UUID" != "null" ]; then
             break
         fi
-        error "Subnet list failed HTTP ${CODE}"
-        printf '%s\n' "$BODY" >&2
-        exit 1
-    fi
-    FILTER_SUBNET_UUID=$(printf '%s\n' "$BODY" | jq -r --arg n "$FILTER_SUBNET_NAME" '
-        .data[]? | select(.name == $n) | .extId' 2>/dev/null | head -n1)
-    if [ -n "$FILTER_SUBNET_UUID" ] && [ "$FILTER_SUBNET_UUID" != "null" ]; then
-        break
-    fi
-    PN=$(printf '%s\n' "$BODY" | jq '(.data // []) | length' 2>/dev/null || echo "0")
-    [ "$PN" -eq 0 ] && break
-    TOT=$(printf '%s\n' "$BODY" | jq -r '.metadata.totalAvailableResults // empty' 2>/dev/null || true)
-    if [ -n "$TOT" ] && [ "$TOT" -gt 0 ] 2>/dev/null; then
-        F=$((SUBNET_LIST_PAGE * SUBNET_LIST_PAGE_LIMIT + PN))
-        [ "$F" -ge "$TOT" ] && break
-    elif [ "$PN" -lt "$SUBNET_LIST_PAGE_LIMIT" ]; then
-        break
-    fi
-    SUBNET_LIST_PAGE=$((SUBNET_LIST_PAGE + 1))
-done
+        PN=$(printf '%s\n' "$BODY" | jq '(.data // []) | length' 2>/dev/null || echo "0")
+        [ "$PN" -eq 0 ] && break
+        TOT=$(printf '%s\n' "$BODY" | jq -r '.metadata.totalAvailableResults // empty' 2>/dev/null || true)
+        if [ -n "$TOT" ] && [ "$TOT" -gt 0 ] 2>/dev/null; then
+            F=$((SUBNET_LIST_PAGE * SUBNET_LIST_PAGE_LIMIT + PN))
+            [ "$F" -ge "$TOT" ] && break
+        elif [ "$PN" -lt "$SUBNET_LIST_PAGE_LIMIT" ]; then
+            break
+        fi
+        SUBNET_LIST_PAGE=$((SUBNET_LIST_PAGE + 1))
+    done
 
-if [ "$SUBNET_SOURCE" = "v42" ]; then
-    if [ -z "$FILTER_SUBNET_UUID" ] || [ "$FILTER_SUBNET_UUID" = "null" ]; then
-        error "Subnet not found: \"${FILTER_SUBNET_NAME}\""
-        exit 1
+    if [ "$SUBNET_SOURCE" = "v42" ]; then
+        if [ -z "$FILTER_SUBNET_UUID" ] || [ "$FILTER_SUBNET_UUID" = "null" ]; then
+            error "Subnet not found: \"${FILTER_SUBNET_NAME}\""
+            exit 1
+        fi
     fi
+    stage "Subnet found (${SUBNET_SOURCE}): id=${FILTER_SUBNET_UUID}"
+}
+
+if [ -n "$CHECK_IP" ]; then
+    if [ -n "$FILTER_SUBNET_NAME" ]; then
+        ResolveSubnetIdentityFromName
+    else
+        FILTER_SUBNET_UUID=""
+    fi
+    RunCheckIpAcrossVms
+    success "Check complete"
+    exit 0
 fi
-stage "Subnet found (${SUBNET_SOURCE}): id=${FILTER_SUBNET_UUID}"
+
+ResolveSubnetIdentityFromName
 
 # --- Subnet config for report header (v4.2 GET or v3 entity fields) ---
 if [ "$SUBNET_SOURCE" = "v42" ]; then
