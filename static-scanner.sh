@@ -14,6 +14,12 @@ NC='\033[0m'
 error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
 success() { echo -e "${GREEN}SUCCESS:${NC} $1"; }
 warning() { echo -e "${YELLOW}WARNING:${NC} $1" >&2; }
+# Expected follow-ups (e.g. v4.2 missing, v3 path) — only print with -v.
+verbose_warning() {
+    if [ "$VERBOSE" = true ]; then
+        warning "$1"
+    fi
+}
 VERBOSE=false
 info() {
     if [ "$VERBOSE" = true ]; then
@@ -145,6 +151,14 @@ BASIC_AUTH=$(echo -n "${NUTANIX_USER}:${NUTANIX_PASSWORD}" | base64)
 
 SUBNET_LIST_PAGE_LIMIT=100
 VNICS_PAGE_LIMIT=100
+if [ "$VERBOSE" = true ]; then
+    echo "================================================"
+    echo "Using..."
+    echo "SUBNET_NAME: ${FILTER_SUBNET_NAME}"
+    echo "NUTANIX_USER: ${NUTANIX_USER}"
+    echo "NUTANIX_PASSWORD: ${NUTANIX_PASSWORD}"
+    echo "NUTANIX_ENDPOINT: ${BASE_URL}"
+fi
 
 make_api_request() {
     local METHOD="${1:?}"
@@ -259,6 +273,7 @@ EmitK8sClustersOnSubnet() {
 TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'ip-used-check')
 VM_IDS_FILE="${TMP_DIR}/vm_ids"
 SUBNET_BODY_FILE="${TMP_DIR}/subnet_v4.json"
+SUBNET_V3_ENTITY_FILE="${TMP_DIR}/subnet_v3_entity.json"
 STATIC_ROWS_FILE="${TMP_DIR}/static_rows"
 cleanup() { rm -rf "$TMP_DIR" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -266,16 +281,92 @@ trap cleanup EXIT
 : > "$VM_IDS_FILE"
 : > "$STATIC_ROWS_FILE"
 
-# --- Resolve subnet extId by name (paginated v4.2 list) ---
-stage "Resolve subnet extId by name (v4.2 GET /config/subnets, paginated)"
-SUBNET_LIST_PAGE=0
+# v42: networking v4.2 list + GET. v3: first-page 404 on subnet list → resolve via v3 subnets/list only.
+SUBNET_SOURCE="v42"
 FILTER_SUBNET_UUID=""
+
+# Paginated v3 subnet list; writes first entity matching FILTER_SUBNET_NAME to SUBNET_V3_ENTITY_FILE; sets FILTER_SUBNET_UUID.
+ResolveSubnetViaV3List() {
+    local v3Ep="${BASE_URL}/api/nutanix/v3/subnets/list"
+    local off=0
+    local lim="${SUBNET_LIST_PAGE_LIMIT}"
+    local v3Resp v3Code v3Body tot got matched
+    stage "Resolve subnet by name via v3 POST /subnets/list (networking v4.2 list unavailable)"
+    verbose_warning "GET /api/networking/v4.2/config/subnets returned HTTP 404 — using v3 subnets/list for name → uuid and subnet header fields."
+    matched=""
+    while true; do
+        local reqJson
+        reqJson=$(jq -nc --argjson o "$off" --argjson l "$lim" '{kind:"subnet",offset:$o,length:$l}')
+        v3Resp=$(make_api_request "POST" "$v3Ep" "$reqJson")
+        v3Code=$(printf '%s\n' "$v3Resp" | tail -n1)
+        v3Body=$(printf '%s\n' "$v3Resp" | sed '$d')
+        if [ "$v3Code" != "200" ]; then
+            error "v3 subnets/list failed HTTP ${v3Code} (POST ${v3Ep})"
+            printf '%s\n' "$v3Body" >&2
+            return 1
+        fi
+        if [ "$VERBOSE" = true ]; then
+            echo "========== v3 subnets/list parse (offset=${off}, length=${lim}) ==========" >&2
+            printf '%s\n' "$v3Body" | jq -c '
+                {
+                  api_version,
+                  metadata: .metadata,
+                  entityCount: ((.entities // []) | length),
+                  names: [ (.entities // [])[] | (.spec.name // .status.name // empty) ] | map(select(. != ""))
+                }
+            ' >&2 2>/dev/null || printf '%s\n' "$v3Body" >&2
+            echo "========== end v3 parse summary ==========" >&2
+        fi
+        matched=$(printf '%s\n' "$v3Body" | jq -c --arg n "$FILTER_SUBNET_NAME" '
+            (.entities // [])[] | select((.spec.name // .status.name // "") == $n)' 2>/dev/null | head -n1)
+        if [ -n "$matched" ]; then
+            printf '%s\n' "$matched" > "$SUBNET_V3_ENTITY_FILE"
+            FILTER_SUBNET_UUID=$(jq -r '.metadata.uuid // empty' "$SUBNET_V3_ENTITY_FILE")
+            if [ -z "$FILTER_SUBNET_UUID" ] || [ "$FILTER_SUBNET_UUID" = "null" ]; then
+                error "v3 entity matched name \"${FILTER_SUBNET_NAME}\" but metadata.uuid was empty."
+                if [ "$VERBOSE" = true ]; then
+                    echo "========== v3 matched entity (raw) ==========" >&2
+                    printf '%s\n' "$matched" >&2
+                    echo "========== end ==========" >&2
+                fi
+                return 1
+            fi
+            if [ "$VERBOSE" = true ]; then
+                echo "========== v3 matched entity for \"${FILTER_SUBNET_NAME}\" (full JSON for field mapping) ==========" >&2
+                jq . "$SUBNET_V3_ENTITY_FILE" >&2
+                echo "========== end v3 matched entity ==========" >&2
+            fi
+            return 0
+        fi
+        got=$(printf '%s\n' "$v3Body" | jq '(.entities // []) | length' 2>/dev/null || echo "0")
+        tot=$(printf '%s\n' "$v3Body" | jq -r '.metadata.total_matches // empty' 2>/dev/null || true)
+        if [ -z "$tot" ] || ! [ "$tot" -eq "$tot" ] 2>/dev/null; then
+            [ "$got" -eq 0 ] && break
+            [ "$got" -lt "$lim" ] && break
+        else
+            off=$((off + got))
+            [ "$off" -ge "$tot" ] && break
+            [ "$got" -eq 0 ] && break
+        fi
+    done
+    error "Subnet not found via v3 list: \"${FILTER_SUBNET_NAME}\""
+    return 1
+}
+
+# --- Resolve subnet extId by name (paginated v4.2 list, or v3 list on first-page 404) ---
+stage "Resolve subnet id by name (v4.2 GET /config/subnets, paginated)"
+SUBNET_LIST_PAGE=0
 while true; do
     EP="${BASE_URL}/api/networking/v4.2/config/subnets?\$page=${SUBNET_LIST_PAGE}&\$limit=${SUBNET_LIST_PAGE_LIMIT}"
     RESP=$(make_api_request "GET" "$EP")
     CODE=$(printf '%s\n' "$RESP" | tail -n1)
     BODY=$(printf '%s\n' "$RESP" | sed '$d')
     if [ "$CODE" != "200" ]; then
+        if [ "$SUBNET_LIST_PAGE" -eq 0 ] && [ "$CODE" = "404" ]; then
+            SUBNET_SOURCE="v3"
+            ResolveSubnetViaV3List || exit 1
+            break
+        fi
         error "Subnet list failed HTTP ${CODE}"
         printf '%s\n' "$BODY" >&2
         exit 1
@@ -297,36 +388,66 @@ while true; do
     SUBNET_LIST_PAGE=$((SUBNET_LIST_PAGE + 1))
 done
 
-if [ -z "$FILTER_SUBNET_UUID" ] || [ "$FILTER_SUBNET_UUID" = "null" ]; then
-    error "Subnet not found: \"${FILTER_SUBNET_NAME}\""
-    exit 1
+if [ "$SUBNET_SOURCE" = "v42" ]; then
+    if [ -z "$FILTER_SUBNET_UUID" ] || [ "$FILTER_SUBNET_UUID" = "null" ]; then
+        error "Subnet not found: \"${FILTER_SUBNET_NAME}\""
+        exit 1
+    fi
 fi
-stage "Subnet found: extId=${FILTER_SUBNET_UUID}"
+stage "Subnet found (${SUBNET_SOURCE}): id=${FILTER_SUBNET_UUID}"
 
-# --- Subnet v4 GET (CIDR + DHCP pool for report header) ---
-stage "GET subnet config (CIDR, DHCP pool) for report header"
-SUB_GET="${BASE_URL}/api/networking/v4.2/config/subnets/${FILTER_SUBNET_UUID}"
-SRESP=$(make_api_request "GET" "$SUB_GET")
-SCODE=$(printf '%s\n' "$SRESP" | tail -n1)
-SBODY=$(printf '%s\n' "$SRESP" | sed '$d')
-if [ "$SCODE" != "200" ]; then
-    error "Subnet GET failed HTTP ${SCODE}"
-    exit 1
-fi
-printf '%s\n' "$SBODY" > "$SUBNET_BODY_FILE"
+# --- Subnet config for report header (v4.2 GET or v3 entity fields) ---
+if [ "$SUBNET_SOURCE" = "v42" ]; then
+    stage "GET subnet config (CIDR, DHCP pool) for report header (v4.2)"
+    SUB_GET="${BASE_URL}/api/networking/v4.2/config/subnets/${FILTER_SUBNET_UUID}"
+    SRESP=$(make_api_request "GET" "$SUB_GET")
+    SCODE=$(printf '%s\n' "$SRESP" | tail -n1)
+    SBODY=$(printf '%s\n' "$SRESP" | sed '$d')
+    if [ "$SCODE" != "200" ]; then
+        error "Subnet GET failed HTTP ${SCODE}"
+        exit 1
+    fi
+    printf '%s\n' "$SBODY" > "$SUBNET_BODY_FILE"
 
-SUBNET_CIDR=$(jq -r '
-  .data.ipConfig[0].ipv4.ipSubnet
-  | if . then "\(.ip.value)/\(.prefixLength)" else empty end
-' "$SUBNET_BODY_FILE" 2>/dev/null)
-[ -z "$SUBNET_CIDR" ] || [ "$SUBNET_CIDR" = "null" ] && SUBNET_CIDR="(unknown)"
+    SUBNET_CIDR=$(jq -r '
+      .data.ipConfig[0].ipv4.ipSubnet
+      | if . then "\(.ip.value)/\(.prefixLength)" else empty end
+    ' "$SUBNET_BODY_FILE" 2>/dev/null)
+    [ -z "$SUBNET_CIDR" ] || [ "$SUBNET_CIDR" = "null" ] && SUBNET_CIDR="(unknown)"
 
-DHCP_START=$(jq -r '.data.ipConfig[0].ipv4.poolList[0].startIp.value // empty' "$SUBNET_BODY_FILE" 2>/dev/null)
-DHCP_END=$(jq -r '.data.ipConfig[0].ipv4.poolList[0].endIp.value // empty' "$SUBNET_BODY_FILE" 2>/dev/null)
-if [ -n "$DHCP_START" ] && [ -n "$DHCP_END" ]; then
-    DHCP_POOL_TXT="${DHCP_START}-${DHCP_END}"
+    DHCP_START=$(jq -r '.data.ipConfig[0].ipv4.poolList[0].startIp.value // empty' "$SUBNET_BODY_FILE" 2>/dev/null)
+    DHCP_END=$(jq -r '.data.ipConfig[0].ipv4.poolList[0].endIp.value // empty' "$SUBNET_BODY_FILE" 2>/dev/null)
+    if [ -n "$DHCP_START" ] && [ -n "$DHCP_END" ]; then
+        DHCP_POOL_TXT="${DHCP_START}-${DHCP_END}"
+    else
+        DHCP_POOL_TXT="(no pool in API response)"
+    fi
 else
-    DHCP_POOL_TXT="(no pool in API response)"
+    stage "Subnet header from v3 entity (skipping v4.2 subnet GET)"
+    SUBNET_CIDR=$(jq -r '
+      ( .status.resources.ip_config // .spec.resources.ip_config )
+      | if . == null then empty else "\(.subnet_ip)/\(.prefix_length)" end
+    ' "$SUBNET_V3_ENTITY_FILE" 2>/dev/null)
+    [ -z "$SUBNET_CIDR" ] || [ "$SUBNET_CIDR" = "null" ] && SUBNET_CIDR="(unknown)"
+
+    DHCP_POOL_TXT=$(jq -r '
+      [ ( .status.resources.ip_config.pool_list // .spec.resources.ip_config.pool_list // [] )[]
+        | .range // empty
+        | gsub(" "; "-")
+      ]
+      | if length > 0 then join(", ") else empty end
+    ' "$SUBNET_V3_ENTITY_FILE" 2>/dev/null)
+    [ -z "$DHCP_POOL_TXT" ] && DHCP_POOL_TXT="(no pool in v3 entity)"
+
+    # First pool "start end" for static-range math (same role as v4.2 poolList[0])
+    firstRange=$(jq -r '
+      ( .status.resources.ip_config.pool_list // .spec.resources.ip_config.pool_list // [] )[0].range // empty
+    ' "$SUBNET_V3_ENTITY_FILE" 2>/dev/null)
+    DHCP_START=""
+    DHCP_END=""
+    if [ -n "$firstRange" ]; then
+        read -r DHCP_START DHCP_END <<< "$(echo "$firstRange" | awk '{print $1,$2}')"
+    fi
 fi
 
 # Static carve-out: usable host addresses in subnet CIDR excluding DHCP pool [start,end].
@@ -390,6 +511,101 @@ if [ -z "$STATIC_RANGE_TXT" ]; then
 fi
 stage "Static carve-out (hosts in CIDR minus DHCP pool) computed"
 
+# v3 subnet mode: when networking v4.2 /vnics is missing, discover VM uuids via v3 /vms/list (FIQL or full scan + NIC filter).
+PopulateVmIdsViaV3Subnet() {
+    local subnetUuid="${1:?}"
+    local ep="${BASE_URL}/api/nutanix/v3/vms/list"
+    local lim=500
+    local off resp code body uuids
+
+    UuidsFromV3VmListJson() {
+        printf '%s\n' "$1" | jq -r --arg su "$subnetUuid" '
+            def subId(n):
+                (n.subnet_reference
+                 | if . == null then ""
+                   elif type == "object" then (.uuid // "")
+                   else (. | tostring) end);
+            (.entities // [])[]
+            | select(
+                [ (.status.resources.nic_list // [])[], (.spec.resources.nic_list // [])[] ]
+                | map(subId(.))
+                | any(. == $su)
+              )
+            | .metadata.uuid // empty
+        ' 2>/dev/null | awk 'NF'
+    }
+
+    stage "v3 VMs list: try FIQL nic_list/subnet_reference==${subnetUuid}"
+    body=$(jq -nc --arg su "$subnetUuid" '{kind:"vm",filter:("nic_list/subnet_reference=="+$su),length:500,offset:0}')
+    resp=$(make_api_request "POST" "$ep" "$body")
+    code=$(printf '%s\n' "$resp" | tail -n1)
+    body=$(printf '%s\n' "$resp" | sed '$d')
+    if [ "$code" = "200" ]; then
+        uuids=$(UuidsFromV3VmListJson "$body")
+        if [ -n "$uuids" ]; then
+            printf '%s\n' "$uuids"
+            return 0
+        fi
+        if [ "$VERBOSE" = true ]; then
+            info "v3 vms/list FIQL returned no matching VMs (or empty entities); falling back to paginated list + client NIC filter."
+        fi
+    elif [ "$VERBOSE" = true ]; then
+        info "v3 vms/list FIQL returned HTTP ${code}; falling back to paginated list + client NIC filter."
+    fi
+
+    stage "v3 VMs list: paginate without filter (max ${lim} per page), filter NICs to subnet ${subnetUuid}"
+    off=0
+    while true; do
+        body=$(jq -nc --argjson o "$off" --argjson l "$lim" '{kind:"vm",length:$l,offset:$o}')
+        resp=$(make_api_request "POST" "$ep" "$body")
+        code=$(printf '%s\n' "$resp" | tail -n1)
+        body=$(printf '%s\n' "$resp" | sed '$d')
+        if [ "$code" != "200" ]; then
+            warning "v3 vms/list failed HTTP ${code} at offset=${off}"
+            return 1
+        fi
+        uuids=$(UuidsFromV3VmListJson "$body")
+        [ -n "$uuids" ] && printf '%s\n' "$uuids"
+        got=$(printf '%s\n' "$body" | jq '(.entities // []) | length' 2>/dev/null || echo "0")
+        tot=$(printf '%s\n' "$body" | jq -r '.metadata.total_matches // empty' 2>/dev/null || true)
+        [ "$got" -eq 0 ] && break
+        if [ -n "$tot" ] && [ "$tot" -gt 0 ] 2>/dev/null; then
+            off=$((off + got))
+            [ "$off" -ge "$tot" ] && break
+        elif [ "$got" -lt "$lim" ]; then
+            break
+        else
+            off=$((off + got))
+        fi
+    done
+    return 0
+}
+
+# IPs on NICs attached to subnet $2 from a v3 VM GET (or list) JSON body at $1 (root entity, not .data).
+# Only ip_endpoint_list entries with type LEARNED (guest-reported), matching v4.2 learnedIpAddresses — not ASSIGNED.
+IpsFromV3VmEntityForSubnet() {
+    local entityJson="${1:?}"
+    local subnetUuid="${2:?}"
+    printf '%s\n' "$entityJson" | jq -r --arg su "$subnetUuid" '
+        def subId(n):
+            (n.subnet_reference
+             | if . == null then ""
+               elif type == "object" then (.uuid // "")
+               else (. | tostring) end);
+        [
+          (.status.resources.nic_list // [])[],
+          (.spec.resources.nic_list // [])[]
+          | select(subId(.) == $su)
+          | (.ip_endpoint_list // [])[]
+          | select(((.type // "") | ascii_upcase) == "LEARNED")
+          | (.ip // empty) | strings
+        ]
+        | map(select(. != ""))
+        | unique
+        | join(",")
+    ' 2>/dev/null
+}
+
 # --- VM UUIDs: v4.2 /vnics only (paginated) ---
 stage "List vNICs on subnet → collect unique VM extIds (paginated)"
 vpage=0
@@ -399,7 +615,12 @@ while true; do
     vc=$(printf '%s\n' "$VR" | tail -n1)
     vb=$(printf '%s\n' "$VR" | sed '$d')
     if [ "$vc" != "200" ]; then
-        warning "vNICs GET failed HTTP ${vc}"
+        if [ "$SUBNET_SOURCE" = "v3" ]; then
+            verbose_warning "vNICs GET failed HTTP ${vc}"
+            verbose_warning "Subnet was resolved via v3; will try v3 POST /vms/list to find VMs on this subnet (v4.2 /vnics unavailable)."
+        else
+            warning "vNICs GET failed HTTP ${vc}"
+        fi
         break
     fi
     printf '%s\n' "$vb" | jq -r '.data[]?.vmReference // empty' 2>/dev/null >> "$VM_IDS_FILE"
@@ -415,6 +636,11 @@ while true; do
     vpage=$((vpage + 1))
 done
 
+if [ "$SUBNET_SOURCE" = "v3" ] && [ ! -s "$VM_IDS_FILE" ]; then
+    stage "Collect VM UUIDs via v3 POST /vms/list (v4.2 subnet/vnics unavailable or empty)"
+    PopulateVmIdsViaV3Subnet "$FILTER_SUBNET_UUID" >> "$VM_IDS_FILE" || true
+fi
+
 awk 'NF' "$VM_IDS_FILE" | sort -u > "${TMP_DIR}/vm_ids.u" && mv "${TMP_DIR}/vm_ids.u" "$VM_IDS_FILE"
 
 VM_COUNT=$(wc -l < "$VM_IDS_FILE" | tr -d '[:space:]')
@@ -422,39 +648,51 @@ VM_COUNT=$(wc -l < "$VM_IDS_FILE" | tr -d '[:space:]')
 stage "Unique VMs attached to subnet: ${VM_COUNT}"
 
 if [ "$VM_COUNT" -gt 0 ]; then
-    stage "Per-VM: GET v4.2 AHV VM config; learnedIpAddresses on NICs for this subnet"
-    # --- Per VM: v4.2 VMM AHV config; learnedIpAddresses on NICs for this subnet extId ---
+    stage "Per-VM: IPs on NICs for this subnet (v4.2 AHV VM GET, or v3 VM GET when v4.2 unavailable)"
+    # --- Per VM: v4.2 learnedIpAddresses, or v3 ip_endpoint_list on NICs for this subnet uuid ---
     while IFS= read -r VM_UUID; do
         [ -z "$VM_UUID" ] && continue
         VM_EP="${BASE_URL}/api/vmm/v4.2/ahv/config/vms/${VM_UUID}"
         VR=$(make_api_request "GET" "$VM_EP")
         VC=$(printf '%s\n' "$VR" | tail -n1)
         VB=$(printf '%s\n' "$VR" | sed '$d')
-        if [ "$VC" != "200" ]; then
-            warning "VM GET failed for ${VM_UUID} (HTTP ${VC}), skipping."
-            continue
+        VM_NAME=""
+        IPS=""
+        if [ "$VC" = "200" ]; then
+            VM_NAME=$(printf '%s\n' "$VB" | jq -r '.data.name // "Unknown"' 2>/dev/null)
+            IPS=$(printf '%s\n' "$VB" | jq -r --arg su "$FILTER_SUBNET_UUID" '
+                [
+                  .data.nics[]?
+                  | select(
+                      ((.nicNetworkInfo.subnet.extId // "") == $su)
+                      or ((.networkInfo.subnet.extId // "") == $su)
+                      or ((.nicNetworkInfo.subnet.uuid // "") == $su)
+                      or ((.networkInfo.subnet.uuid // "") == $su)
+                    )
+                  | (
+                      (.nicNetworkInfo.ipv4Info.learnedIpAddresses // [])
+                      + (.networkInfo.ipv4Info.learnedIpAddresses // [])
+                    )[]
+                  | .value?
+                  | select(. != null and . != "")
+                ]
+                | unique
+                | join(",")
+            ' 2>/dev/null)
         fi
-
-        VM_NAME=$(printf '%s\n' "$VB" | jq -r '.data.name // "Unknown"' 2>/dev/null)
-
-        # Subnet match on nicNetworkInfo and networkInfo (both may be present); static = learnedIpAddresses[].value
-        IPS=$(printf '%s\n' "$VB" | jq -r --arg su "$FILTER_SUBNET_UUID" '
-            [
-              .data.nics[]?
-              | select(
-                  ((.nicNetworkInfo.subnet.extId // "") == $su)
-                  or ((.networkInfo.subnet.extId // "") == $su)
-                )
-              | (
-                  (.nicNetworkInfo.ipv4Info.learnedIpAddresses // [])
-                  + (.networkInfo.ipv4Info.learnedIpAddresses // [])
-                )[]
-              | .value?
-              | select(. != null and . != "")
-            ]
-            | unique
-            | join(",")
-        ' 2>/dev/null)
+        if [ -z "$IPS" ] || [ "$IPS" = "null" ]; then
+            VM_EP3="${BASE_URL}/api/nutanix/v3/vms/${VM_UUID}"
+            VR3=$(make_api_request "GET" "$VM_EP3")
+            VC3=$(printf '%s\n' "$VR3" | tail -n1)
+            VB3=$(printf '%s\n' "$VR3" | sed '$d')
+            if [ "$VC3" = "200" ]; then
+                [ -z "$VM_NAME" ] || [ "$VM_NAME" = "Unknown" ] && VM_NAME=$(printf '%s\n' "$VB3" | jq -r '.status.name // .spec.name // .metadata.uuid // "Unknown"' 2>/dev/null)
+                IPS=$(IpsFromV3VmEntityForSubnet "$VB3" "$FILTER_SUBNET_UUID")
+            elif [ "$VC" != "200" ]; then
+                warning "VM GET failed for ${VM_UUID} (v4.2 HTTP ${VC}, v3 HTTP ${VC3}), skipping."
+                continue
+            fi
+        fi
 
         if [ -n "$IPS" ] && [ "$IPS" != "null" ]; then
             echo "${VM_NAME}|${IPS}" >> "$STATIC_ROWS_FILE"
